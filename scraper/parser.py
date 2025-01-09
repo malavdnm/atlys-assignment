@@ -1,20 +1,25 @@
 import logging
 import os
 from typing import Optional
+
+import aiohttp
 from models import Product
 import aiofiles
 from config import settings
 
+
 class Parser:
-    async def _download_image(self, url: str, product_title: str) -> str:
+    async def _download_image(self, url: str, product_title: str, session: aiohttp.ClientSession) -> str:
         try:
-            async with self.session.get(url) as response:
+            async with session.get(url) as response:
                 if response.status == 200:
                     # Create a valid filename from the product title
                     safe_title = "".join(
                         c for c in product_title if c.isalnum() or c in (" ", "-", "_")
                     ).rstrip()
-                    file_name = f"{settings.IMAGES_PATH}{safe_title}.jpg"
+                    if not safe_title:
+                        safe_title = "default_image"
+                    file_name = os.path.join(settings.IMAGES_PATH, f"{safe_title}.jpg")
                     os.makedirs(settings.IMAGES_PATH, exist_ok=True)
 
                     async with aiofiles.open(file_name, mode="wb") as f:
@@ -30,87 +35,123 @@ class Parser:
             return ""
 
     async def _get_image_url(self, img_element) -> Optional[str]:
-        """
-        Extract the actual image URL from the img element handling lazy loading
-        """
-        if not img_element:
+        try:
+            if not img_element:
+                return None
+
+            img_url = img_element.get("data-lazy-src")
+            if not img_url or img_url.endswith("svg+xml"):
+                img_url = img_element.get("src")
+
+            if not img_url or img_url.endswith("svg+xml"):
+                srcset = img_element.get("srcset")
+                if srcset:
+                    img_url = srcset.split(",")[0].strip().split(" ")[0]
+
+            if not img_url or img_url.endswith("svg+xml"):
+                lazy_srcset = img_element.get("data-lazy-srcset")
+                if lazy_srcset:
+                    img_url = lazy_srcset.split(",")[0].strip().split(" ")[0]
+
+            return img_url
+        except Exception as e:
+            logging.error(f"Error extracting image URL: {str(e)}")
             return None
 
-        # Check data-lazy-src first (actual image URL for lazy-loaded images)
-        img_url = img_element.get("data-lazy-src")
-
-        # If no lazy-src, check regular src
-        if not img_url or img_url.endswith("svg+xml"):
-            img_url = img_element.get("src")
-
-        # If still no URL or it's an SVG placeholder, check srcset
-        if not img_url or img_url.endswith("svg+xml"):
-            srcset = img_element.get("srcset")
-            if srcset:
-                # Take the first URL from srcset
-                img_url = srcset.split(",")[0].strip().split(" ")[0]
-
-        # If still no URL, try data-lazy-srcset
-        if not img_url or img_url.endswith("svg+xml"):
-            lazy_srcset = img_element.get("data-lazy-srcset")
-            if lazy_srcset:
-                # Take the first URL from lazy-srcset
-                img_url = lazy_srcset.split(",")[0].strip().split(" ")[0]
-
-        return img_url
-
-    async def _parse_product(self, product_element) -> Optional[Product]:
+    def _get_product_name(self, product_element) -> Optional[str]:
+        """
+        Extracts the product name from the product element.
+        """
         try:
-            # Find product title - using full title from href/link
             title_element = product_element.find(
                 "h2", class_="woo-loop-product__title"
             ).find("a")
-            print(title_element)
             if not title_element:
+                logging.warning("No title element found")
                 return None
-            # Get full title from aria-label attribute of add to cart button
-            title_tag = product_element.find('a', {'data-title': True})
-            # print(title_tag)
-            title = title_tag["data-title"] if title_tag else title_element.text.strip()
 
-            # Find price - handle sale prices
+            title_tag = product_element.find("a", {"data-title": True})
+            title = (
+                title_tag["data-title"].strip()
+                if title_tag and "data-title" in title_tag.attrs
+                else title_element.text.strip()
+            )
+
+            if not title:
+                logging.warning("Product title is empty")
+                return None
+
+            return title
+        except Exception as e:
+            logging.error(f"Error extracting product name: {str(e)}")
+            return None
+
+    def _get_product_price(self, product_element) -> Optional[float]:
+        """
+        Extracts the product price from the product element.
+        """
+        try:
             price_box = product_element.find("span", class_="price")
             if not price_box:
+                logging.warning("No price found for the product")
                 return None
 
-            # Try to get sale price first (ins tag), if not found get regular price
             sale_price = price_box.find("ins")
-            if sale_price:
-                price_element = sale_price.find(
-                    "span", class_="woocommerce-Price-amount"
-                )
-            else:
-                price_element = price_box.find(
-                    "span", class_="woocommerce-Price-amount"
-                )
+            price_element = (
+                sale_price.find("span", class_="woocommerce-Price-amount")
+                if sale_price
+                else price_box.find("span", class_="woocommerce-Price-amount")
+            )
 
             if not price_element:
+                logging.warning("No price element found for the product")
                 return None
 
-            # Extract price value and handle different formats
             price_text = price_element.text.strip()
-            # Remove currency symbol and convert to float
-            price_value = float(price_text.replace("₹", "").replace(",", "").strip())
+            try:
+                price_value = float(price_text.replace("₹", "").replace(",", "").strip())
+            except ValueError:
+                logging.error(f"Invalid price format: {price_text}")
+                return None
 
-            # Find image URL - handle lazy loading
+            return price_value
+        except Exception as e:
+            logging.error(f"Error extracting product price: {str(e)}")
+            return None
+
+    async def parse_product(self, product_element, session: aiohttp.ClientSession) -> Optional[Product]:
+        try:
+            # Extract product name
+            title = self._get_product_name(product_element)
+            if not title:
+                return None
+
+            # Extract product price
+            price_value = self._get_product_price(product_element)
+            if price_value is None:
+                logging.warning(f"Skipping product due to missing price: {title}")
+                return None
+
+            # Extract image URL
             img_element = product_element.find(
                 "img", class_="attachment-woocommerce_thumbnail"
             )
             if not img_element:
+                logging.warning(f"No image element found for product: {title}")
                 return None
 
             img_url = await self._get_image_url(img_element)
             if not img_url:
+                logging.warning(f"No valid image URL found for product: {title}")
                 return None
 
             # Download image
-            image_path = await self._download_image(img_url, title)
-            print(title, price_value, image_path)
+            image_path = await self._download_image(img_url, title, session)
+            if not image_path:
+                logging.warning(f"Failed to download image for product: {title}")
+                return None
+
+            logging.info(f"Parsed product successfully: {title}")
             return Product(
                 product_title=title, product_price=price_value, path_to_image=image_path
             )

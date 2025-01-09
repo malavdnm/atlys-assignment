@@ -14,7 +14,7 @@ from scraper.parser import Parser
 
 
 class DentalStallScraper:
-    BASE_URL = "https://dentalstall.com/shop"
+    BASE_URL = "https://dentalstall.com/shop/page/42"
 
     def __init__(self, storage_strategy, notification_strategy):
         self.storage = storage_strategy
@@ -122,6 +122,9 @@ class DentalStallScraper:
 
                     logging.info(f"Scraped page {page}")
                     page += 1
+                    #write in bacthes
+                    await self.storage.save_products(products)
+
                     # Add a small delay between pages to be respectful
                     await asyncio.sleep(1)
 
@@ -131,8 +134,6 @@ class DentalStallScraper:
                     )
                     raise e
 
-            # Save all products at once
-            await self.storage.save_products(all_products)
 
             await self.notification.notify(
                 f"Scraping completed. Total products: {total_products}, Updated: {updated_products}"
